@@ -123,19 +123,12 @@ def process_videos(video_urls):
     """
     transcripts = []
     
-    # Add progress bar for better UX
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for i, url in enumerate(video_urls):
+    for url in video_urls:
         video_id = extract_video_id(url)
         if not video_id:
             st.error(f"Invalid YouTube URL: {url}")
             continue
             
-        status_text.text(f"Processing video {i+1}/{len(video_urls)}: {video_id}")
-        progress_bar.progress((i) / len(video_urls))
-        
         try:
             # Use yt-dlp to get video info and subtitles
             cmd = [
@@ -149,12 +142,7 @@ def process_videos(video_urls):
                 url
             ]
             
-            # Add longer timeout and better error handling
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            
-            # Wait a moment for files to be written
-            import time
-            time.sleep(1)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             
             # Look for generated subtitle files
             import glob
@@ -163,15 +151,6 @@ def process_videos(video_urls):
             subtitle_files = glob.glob(f'temp_{video_id}*.vtt')
             
             transcript_text = ""
-            
-            # Try multiple times if files aren't found immediately
-            max_retries = 3
-            for retry in range(max_retries):
-                subtitle_files = glob.glob(f'temp_{video_id}*.vtt')
-                if subtitle_files:
-                    break
-                time.sleep(2)  # Wait 2 seconds before retry
-                
             for subtitle_file in subtitle_files:
                 try:
                     with open(subtitle_file, 'r', encoding='utf-8') as f:
@@ -180,40 +159,29 @@ def process_videos(video_urls):
                     os.remove(subtitle_file)  # Clean up
                     break
                 except Exception as e:
-                    st.warning(f"Error reading subtitle file {subtitle_file}: {str(e)}")
                     continue
             
             if transcript_text.strip():
                 transcripts.append(transcript_text)
-                st.success(f"✅ Successfully extracted transcript for: {url}")
+                st.info(f"Successfully extracted transcript for: {url}")
             else:
-                st.error(f"❌ No transcript found for: {url}")
+                st.error(f"No transcript found for: {url}")
                 
         except subprocess.TimeoutExpired:
-            st.error(f"⏱️ Timeout while processing: {url}")
+            st.error(f"Timeout while processing: {url}")
         except Exception as e:
-            st.error(f"💥 Error processing {url}: {str(e)}")
+            st.error(f"Error processing {url}: {str(e)}")
             continue
 
-    progress_bar.progress(1.0)
-    status_text.text("Processing complete!")
-    
-    # Clear progress indicators after a moment
-    time.sleep(1)
-    progress_bar.empty()
-    status_text.empty()
-
     if not transcripts:
-        st.error("❌ No valid transcripts retrieved. Please check the video URLs.")
+        st.error("No valid transcripts retrieved. Please check the video URLs.")
         return None, None
 
     combined_transcript = " ".join(transcripts)
     
     if not combined_transcript.strip():
-        st.error("❌ All retrieved transcripts are empty.")
+        st.error("All retrieved transcripts are empty.")
         return None, None
-
-    st.info("🔄 Creating vector store and search index...")
 
     # Split transcript into chunks (same as original)
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -232,10 +200,9 @@ def process_videos(video_urls):
             st.session_state.vector_stores[st.session_state.current_session_id] = vector_store
             st.session_state.bm25_indices[st.session_state.current_session_id] = (bm25_index, chunks)
         
-        st.success("✅ Vector store created successfully!")
         return vector_store, (bm25_index, chunks)
     except Exception as e:
-        st.error(f"💥 Error creating vector store: {str(e)}")
+        st.error(f"Error creating vector store: {str(e)}")
         return None, None
 
 def parse_vtt_content(content):
@@ -725,7 +692,7 @@ else:
     if submit_button:
         st.warning("Please process a valid YouTube video first.")
     else:
-        st.info("👆 Please submit YouTube video links above to start chatting! and hit clear button after every new request")
+        st.info("👆 Please submit YouTube video links above to start chatting!and hit clear button before every request")
         st.markdown("""
         ### 🚀 Features:
         - **Text Input**: Type your questions normally
