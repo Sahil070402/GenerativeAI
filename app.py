@@ -18,6 +18,7 @@ from langchain.retrievers.multi_query import MultiQueryRetriever
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import LLMChainExtractor
 from audio_recorder_streamlit import audio_recorder
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
 
 
 # Load environment variables
@@ -30,8 +31,6 @@ if 'bm25_indices' not in st.session_state:
     st.session_state.bm25_indices = {}
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
-if 'video_processed' not in st.session_state:
-    st.session_state.video_processed = False
 if 'chat_sessions' not in st.session_state:
     st.session_state.chat_sessions = {}
 if 'current_session_id' not in st.session_state:
@@ -115,11 +114,22 @@ def extract_video_id(url):
     except Exception:
         return None
 
-# Function to fetch and process transcripts
-# Function to fetch and process transcripts
+def parse_vtt_content(content):
+    """Parse VTT subtitle content and extract clean text."""
+    import re
+    content = re.sub(r'WEBVTT.*?\n\n', '', content, flags=re.DOTALL)
+    content = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}.*?\n', '', content)
+    content = re.sub(r'<[^>]+>', '', content)
+    lines = content.split('\n')
+    clean_lines = [line.strip() for line in lines if line.strip() and not line.strip().isdigit()]
+    return ' '.join(clean_lines)
+
+# Function to fetch and process transcripts with a two-stage fallback system (yt-dlp first)
 def process_videos(video_urls):
     """
-    Sure-shot method using yt-dlp - works 99% of the time
+    Fetches transcripts using the most stable two-stage method.
+    1. Primary: yt-dlp (robust command-line tool).
+    2. Fallback: youtube-transcript-api (alternative API access).
     """
     transcripts = []
     
@@ -128,53 +138,66 @@ def process_videos(video_urls):
         if not video_id:
             st.error(f"Invalid YouTube URL: {url}")
             continue
-            
+
+        transcript_text = ""
+        
+        # --- STAGE 1: Try yt-dlp (Primary Method) ---
         try:
-            # Use yt-dlp to get video info and subtitles
+            st.info(f"Attempting to fetch transcript for {url} using primary method (yt-dlp)...")
             cmd = [
-                'yt-dlp', 
-                '--write-auto-sub',  # Get auto-generated subtitles
-                '--write-sub',       # Get manual subtitles if available
-                '--sub-lang', 'en',  # Prefer English
-                '--skip-download',   # Don't download video
-                '--sub-format', 'vtt',
-                '--output', f'temp_%(id)s.%(ext)s',
-                url
+                'yt-dlp', '--no-playlist', '--write-auto-sub', '--write-sub', 
+                '--sub-lang', 'en,en-US,en-GB', '--sub-format', 'vtt', 
+                '--skip-download', '--output', f'temp_{video_id}.%(ext)s', url
             ]
+            subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=True)
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            import glob, os
+            subtitle_file = next(iter(glob.glob(f'temp_{video_id}*.vtt')), None)
             
-            # Look for generated subtitle files
-            import glob
-            import os
+            if not subtitle_file:
+                raise FileNotFoundError("yt-dlp did not download a subtitle file.")
+
+            with open(subtitle_file, 'r', encoding='utf-8') as f:
+                transcript_text = parse_vtt_content(f.read())
+            os.remove(subtitle_file)
             
-            subtitle_files = glob.glob(f'temp_{video_id}*.vtt')
+            if not transcript_text.strip():
+                raise ValueError("yt-dlp produced an empty transcript.")
             
-            transcript_text = ""
-            for subtitle_file in subtitle_files:
-                try:
-                    with open(subtitle_file, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        transcript_text = parse_vtt_content(content)
-                    os.remove(subtitle_file)  # Clean up
-                    break
-                except Exception as e:
-                    continue
+            st.success(f"Successfully extracted transcript via primary method (yt-dlp).")
+
+        except Exception as dlp_error:
+            st.warning(f"Primary method (yt-dlp) failed for {url}. Reason: {dlp_error}. Falling back to secondary API...")
             
-            if transcript_text.strip():
-                transcripts.append(transcript_text)
-                st.info(f"Successfully extracted transcript for: {url}")
-            else:
-                st.error(f"No transcript found for: {url}")
+            # --- STAGE 2: Fallback to youtube-transcript-api ---
+            try:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                language_codes = ['en', 'en-US', 'en-GB'] + [t.language_code for t in transcript_list]
                 
-        except subprocess.TimeoutExpired:
-            st.error(f"Timeout while processing: {url}")
-        except Exception as e:
-            st.error(f"Error processing {url}: {str(e)}")
-            continue
+                for lang_code in sorted(set(language_codes), key=lambda x: language_codes.index(x)):
+                    try:
+                        transcript = transcript_list.find_transcript([lang_code])
+                        transcript_data = transcript.fetch()
+                        temp_text = " ".join([d['text'] for d in transcript_data])
+                        if temp_text.strip():
+                            transcript_text = temp_text
+                            st.success(f"Successfully extracted transcript via fallback API (Language: {transcript.language})")
+                            break
+                    except Exception:
+                        continue
+                
+                if not transcript_text.strip():
+                    raise ValueError("Fallback API also failed to find a usable transcript.")
+
+            except Exception as api_error:
+                st.error(f"All methods failed for {url}. Could not retrieve any transcript. Final error: {api_error}")
+                transcript_text = ""
+
+        if transcript_text.strip():
+            transcripts.append(transcript_text)
 
     if not transcripts:
-        st.error("No valid transcripts retrieved. Please check the video URLs.")
+        st.error("No valid transcripts retrieved. Please check the video URLs or ensure they have subtitles enabled.")
         return None, None
 
     combined_transcript = " ".join(transcripts)
@@ -183,19 +206,19 @@ def process_videos(video_urls):
         st.error("All retrieved transcripts are empty.")
         return None, None
 
-    # Split transcript into chunks (same as original)
+    # Split transcript into chunks
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.create_documents([combined_transcript])
 
-    # Create vector store (same as original)
+    # Create vector store
     embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
     try:
         vector_store = FAISS.from_documents(chunks, embeddings)
-        # Create BM25 index for hybrid retrieval (same as original)
+        # Create BM25 index for hybrid retrieval
         tokenized_chunks = [doc.page_content.split() for doc in chunks]
         bm25_index = BM25Okapi(tokenized_chunks)
         
-        # Store both in the current session (same as original)
+        # Store both in the current session
         if st.session_state.current_session_id:
             st.session_state.vector_stores[st.session_state.current_session_id] = vector_store
             st.session_state.bm25_indices[st.session_state.current_session_id] = (bm25_index, chunks)
@@ -204,32 +227,6 @@ def process_videos(video_urls):
     except Exception as e:
         st.error(f"Error creating vector store: {str(e)}")
         return None, None
-
-def parse_vtt_content(content):
-    """Parse VTT subtitle content and extract clean text"""
-    import re
-    
-    # Remove VTT headers
-    content = re.sub(r'WEBVTT.*?\n\n', '', content, flags=re.DOTALL)
-    
-    # Remove timing lines (00:00:00.000 --> 00:00:05.000)
-    content = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}.*?\n', '', content)
-    
-    # Remove position and styling tags
-    content = re.sub(r'<[^>]+>', '', content)
-    content = re.sub(r'align:start position:\d+%', '', content)
-    
-    # Split into lines and clean
-    lines = content.split('\n')
-    clean_lines = []
-    
-    for line in lines:
-        line = line.strip()
-        # Skip empty lines, numbers, and timing info
-        if line and not line.isdigit() and not re.match(r'\d{2}:\d{2}:\d{2}', line):
-            clean_lines.append(line)
-    
-    return ' '.join(clean_lines)
 
 # Function for hybrid retrieval with fixed deduplication
 def hybrid_retrieval(query, vector_store, bm25_index, chunks, k=4):
@@ -282,10 +279,8 @@ if submit_button and video_links:
                 st.session_state.chat_sessions[st.session_state.current_session_id] = []
             vector_store, bm25_data = process_videos(video_urls)
             if vector_store:
-                st.session_state.video_processed = True
                 st.success("Videos processed successfully! You can now ask questions.")
-            else:
-                st.session_state.video_processed = False
+            # No else needed, process_videos handles its own error messages
         else:
             st.error("Please provide at least one valid YouTube URL.")
 
@@ -295,26 +290,23 @@ if st.session_state.current_session_id and st.session_state.current_session_id i
         st.subheader("Chat Session Management")
         if st.button("New Chat"):
             st.session_state.session_counter += 1
-            st.session_state.current_session_id = f"Session {st.session_state.session_counter}"
-            st.session_state.chat_sessions[st.session_state.current_session_id] = []
-            if st.session_state.current_session_id in st.session_state.vector_stores:
-                del st.session_state.vector_stores[st.session_state.current_session_id]
-            if st.session_state.current_session_id in st.session_state.bm25_indices:
-                del st.session_state.bm25_indices[st.session_state.current_session_id]
-            st.session_state.video_processed = False
+            new_session_id = f"Session {st.session_state.session_counter}"
+            st.session_state.current_session_id = new_session_id
+            st.session_state.chat_sessions[new_session_id] = []
             st.session_state.audio_text = ""
             st.session_state.recording_complete = False
-            st.success("Started a new chat session!")
+            st.success("Started a new chat session! Please submit a video for this new session.")
+            st.rerun()
         
         session_ids = list(st.session_state.chat_sessions.keys())
         if session_ids:
             selected_session = st.selectbox("Select Previous Chat", options=session_ids, index=session_ids.index(st.session_state.current_session_id) if st.session_state.current_session_id in session_ids else 0)
             if selected_session != st.session_state.current_session_id:
                 st.session_state.current_session_id = selected_session
-                st.session_state.video_processed = st.session_state.current_session_id in st.session_state.vector_stores
                 st.session_state.audio_text = ""
                 st.session_state.recording_complete = False
                 st.success(f"Switched to {selected_session}")
+                st.rerun()
 
         # Toggles for showing steps and mode selection
         st.session_state.show_steps = st.checkbox("Show Processing Flow", value=st.session_state.show_steps)
@@ -341,7 +333,7 @@ if st.session_state.current_session_id and st.session_state.current_session_id i
     bm25_index, chunks = st.session_state.bm25_indices[st.session_state.current_session_id]
 
     model = ChatOpenAI(
-        model="gpt-4o-2024-08-06",
+        model="openai/gpt-4.1",
         openai_api_key=os.getenv("OPEN_API_KEY"),
         openai_api_base=os.getenv("BASE_URL"),
     )
@@ -702,4 +694,3 @@ else:
         - **Session Management**: Multiple chat sessions with history
         - **Processing Flow**: Optional step-by-step visualization
         """)
-
